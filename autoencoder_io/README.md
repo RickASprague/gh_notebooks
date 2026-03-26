@@ -8,7 +8,7 @@ ImageNet-64 ships as Python pickle files containing NumPy arrays. Deserializing 
 
 ## The Solution
 
-A one-time preprocessing step converts the Python pickles to flat binary files (just shape headers + raw Float32 payloads). At training time, Julia's `Mmap` maps these files directly into virtual memory — the OS page cache handles the rest. **Result: 1.28M images "loaded" in 0.06 seconds.**
+A one-time preprocessing step converts the Python pickles to flat binary files (just shape headers + raw Float32 payloads). At training time, Julia's `Mmap` maps these files directly into virtual memory — no deserialization, no parsing, no upfront load step. The OS page cache streams data from NVMe on demand. **The ~3 min/pass deserialization cost is completely eliminated.**
 
 ## Hardware
 
@@ -42,6 +42,6 @@ A one-time preprocessing step converts the Python pickles to flat binary files (
 
 ## Results
 
-- **Data load time:** ~0.06s for 1.28M images (vs ~3 min with Python pickles)
+- **Data loading:** No upfront load — mmap eliminates the ~3 min/pass pickle deserialization entirely. Data streams from disk on demand.
 - **Bottleneck comparison:** 8x8x128 latent (good reconstruction) vs 4x4x256 latent (~1/3 compression, visible degradation)
-- **IO throughput:** Well below PCIe Gen5 / NVMe ceiling — GPU compute is the bottleneck, not IO
+- **GPU utilization:** ~50%. Mmap solved the IO problem; remaining gap needs Nsight profiling to diagnose.
