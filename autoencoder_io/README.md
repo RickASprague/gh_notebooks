@@ -1,24 +1,47 @@
-Simple Julia LUX based autoencoder.  This is to just max IO.  Uses julia memory mapping.
+# ImageNet Autoencoder: Maximizing IO Throughput
 
-* ImageNet 64 - 1.28M images
-* 10 epochs
+Can we make the GPU the bottleneck instead of data loading? This project trains a convolutional autoencoder on the full ImageNet-64 dataset (1.28M images, 10 epochs) while minimizing IO overhead using Julia's memory-mapped files.
 
-Done in the following steps:
+## The Problem
 
-1. Convert python input to mmap friendly flat files (1.28M images 64x64x3)
-2. 10 epochs
-3. Monitoring via Tensor Board
-4. Lux.jl deep learning framework.
+ImageNet-64 ships as Python pickle files containing NumPy arrays. Deserializing these from Julia is brutally slow — unpickling + converting 1.28M images takes ~3 minutes per pass. With 10 epochs, that's 30 minutes of pure IO before any GPU work happens.
 
-Setup
-1. AMD Threadripper Pro 7965WX
-   - 256 GB RAM
-   - Ubuntu 24
-   - ZFS - striped 2x4TB NVMe 5
-2. RTX 6000 Blackwell Pro Worstation Edition
+## The Solution
 
-Trying to minimzing GPU memory footprint and minimize IO.
+A one-time preprocessing step converts the Python pickles to flat binary files (just shape headers + raw Float32 payloads). At training time, Julia's `Mmap` maps these files directly into virtual memory — the OS page cache handles the rest. **Result: 1.28M images "loaded" in 0.06 seconds.**
 
-Notebooks
-* Image Preprocess - converts image net 64 python pickles to memory mapped julia binary serialized files.
-* Auto Encoder - trains the rudimentary autoencoder
+## Hardware
+
+| Component | Spec |
+|-----------|------|
+| CPU | AMD Threadripper Pro 7965WX |
+| RAM | 256 GB |
+| GPU | NVIDIA RTX 6000 Blackwell Pro (Workstation Edition) |
+| Storage | ZFS striped 2x4TB NVMe Gen5 |
+| OS | Ubuntu 24 |
+
+## Stack
+
+- **Julia** / **Lux.jl** (deep learning framework)
+- **CUDA.jl** / **LuxCUDA** (GPU acceleration)
+- **TensorBoard** (loss monitoring)
+- **CairoMakie** (visualization)
+- Custom `MMapReader` for zero-copy data loading (see `lib/utils.jl`)
+
+## Notebooks
+
+| Notebook | Description |
+|----------|-------------|
+| `Image Preprocess.ipynb` | One-time conversion: ImageNet-64 Python pickles → memory-mapped Julia binary files |
+| `Auto Encoder.ipynb` | Trains the autoencoder, profiles IO throughput, compares reconstruction quality at different bottleneck sizes |
+
+## Key Files
+
+- `lib/utils.jl` — Custom binary serialization and `MMapReader` (mmap-backed zero-copy deserialization)
+- `lib/imagenet.jl` — Python pickle loading via PythonCall (used only in preprocessing)
+
+## Results
+
+- **Data load time:** ~0.06s for 1.28M images (vs ~3 min with Python pickles)
+- **Bottleneck comparison:** 8x8x128 latent (good reconstruction) vs 4x4x256 latent (~1/3 compression, visible degradation)
+- **IO throughput:** Well below PCIe Gen5 / NVMe ceiling — GPU compute is the bottleneck, not IO

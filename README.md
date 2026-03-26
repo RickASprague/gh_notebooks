@@ -1,4 +1,4 @@
-Various jupyter notebooks.
+Various Jupyter notebooks — Julia/CUDA experiments on a Threadripper Pro + RTX 6000 Blackwell workstation.
 
-* registration_se2 - lie group registration in 2d.
-* autoencoder_io - __deactivated for the moment__.  Benching memmory mapped input to ensure the GPU isn't starved.  Autoencode the all 1.2M 64x64 images.  Measure impact of RMSE on latent vector size.  How bad is the recall as the latent vector starts to shrink in size.
+* **registration_se2** — Lie group registration in 2D.
+* **autoencoder_io** — Can we make the GPU the bottleneck instead of data loading? Trains a convolutional autoencoder on full ImageNet-64 (1.28M images) using memory-mapped IO. Python pickle deserialization was too slow (~3 min/pass), so a custom `MMapReader` loads the entire dataset in 0.06 seconds. Measures reconstruction quality vs latent dimension size (8x8x128 vs 4x4x256).
