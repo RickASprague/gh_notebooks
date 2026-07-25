@@ -1,8 +1,14 @@
 Various Jupyter notebooks:
 
 * **registration_se2** — Lie group registration in 2D.
-* **autoencoder_io** — Can we make the GPU the bottleneck instead of data loading? Trains a convolutional autoencoder on full ImageNet-64 (1.28M images) using memory-mapped IO. Python pickle deserialization was too slow (~3 min/pass), so a custom `MMapReader` eliminates the upfront load entirely — data streams from NVMe on demand via the OS page cache. Measures reconstruction quality vs latent dimension size (8x8x128 vs 4x4x256).
+* **dm** — Decision making: sequential choices that maximize expected return (MDPs).
+  * `rl` — Reinforcement learning, model-free.
+    * `ddqn` — Double DQN (replay, target network, Huber loss, n-step returns), solving LunarLander, CartPole, Acrobot and MountainCar (Julia, Lux, Gymnasium via PyCall).
+* **imagenet64** — models on full ImageNet-64 (1.28M images, 64×64), sharing one set of memory-mapped shards.
+  * `autoencoder_io` — Can we make the GPU the bottleneck instead of data loading? Trains a convolutional autoencoder from memory-mapped shards, so there is no per-pass deserialization and no upfront load. Profiles the training step with Nsight Systems and Nsight Compute, measures reconstruction quality, and simulates 5-way data-parallel training on one GPU (Julia, markdown + scripts).
+  * `classifier` — The supervised twin of the autoencoder: same encoder and mmap'd pipeline, with global average pooling and a linear head trained by cross-entropy over the 1000 classes. A simple baseline to build on (Julia, Lux).
+* **system_identification** 
+    — `coulomb/` identifies Coulomb's law $\dot{\mathbf v} = \alpha\mathbf x/r^3$ with SINDy vs a neural network, and shows where the network fails out of sample (Julia, markdown + scripts).
 * **other** — standalone notes.
-  * `rotating_frame.ipynb` — rotating-reference-frame kinematics from first principles: the transport theorem and the four-term acceleration (relative / Coriolis / centripetal / Euler — and why the same terms read as real inward accelerations in the inertial frame but fictitious centrifugal/Coriolis forces in the body frame), then nested transforms C→B→A in three cases: a static mount (a fixed extrinsic R folds into the composition, no new terms), a dynamic inner spin (cross-Coriolis / gyroscopic couplings plus centripetal & Euler terms on the mounting offset), and coincident origins (rotations multiply, angular velocities add, the stack collapses to one rotating frame). Worked carousel + turning-car examples close it out — a steady turn *is* a carousel, differing only in where you put the origin.
   * `android_imu.ipynb` — the Android device sensor coordinate frame and what an accelerometer's "specific force" reading actually reports.
 

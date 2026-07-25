@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Local JupyterLab for gh_notebooks, using this folder's uv env (pyproject.toml / uv.lock,
+# pinned to match the jupyter server's notebooks/.venv as of 2026-10-16).
+# Usage: ./lab [extra jupyter lab args]      PORT=8890 ./lab   to change the port
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+export JULIA_NUM_THREADS=auto
+export JULIA_PYTHONCALL_EXE="$PWD/.venv/bin/python"   # as on the server: PythonCall uses this env
+exec uv run --frozen jupyter lab --ServerApp.root_dir="$PWD" --port="${PORT:-8889}" "$@"
