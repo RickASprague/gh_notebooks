@@ -1,4 +1,7 @@
 *-checkpoint.ipynb
 *-checkpoint.md
 *-checkpoint.jl
+.ipynb_checkpoints
+.claude
+.venv
 
