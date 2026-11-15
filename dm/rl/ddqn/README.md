@@ -1,7 +1,8 @@
 # DDQN: Double DQN (+ n-step, Huber, replay, target net) in Julia, on Lunar Lander & CartPole
 
 Gymnasium's `LunarLander-v3` (discrete: 4 actions) driven from Julia via PyCall; the Q-function is a
-[Lux](https://lux.csail.mit.edu) network trained with Zygote + Adam. Built up step by step, learning
+[Lux](https://lux.csail.mit.edu) network trained with Adam, compiled to XLA by [Reactant](https://github.com/EnzymeAD/Reactant.jl)
+and differentiated by [Enzyme](https://enzyme.mit.edu) (see *Reactant + Enzyme*). Built up step by step, learning
 classic value-based RL toward DQN. The same learner also runs `CartPole-v1` (see *Environments*).
 
 ## What's implemented
@@ -10,7 +11,7 @@ classic value-based RL toward DQN. The same learner also runs `CartPole-v1` (see
    $Q_\theta(s, \cdot) : \mathbb{R}^8 \to \mathbb{R}^4$ (`Dense(8→64, tanh) → Dense(64→4)`). For a
    transition $(s, a, r, s', d)$:
 
-   - target $t = r + \gamma (1 - d) \max_{a'} Q_\theta(s', a')$ — a **constant** (built from `learner.p`, not tracked by Zygote)
+   - target $t = r + \gamma (1 - d) \max_{a'} Q_\theta(s', a')$ — a **constant** (`ignore_derivatives`: no gradient flows through it)
    - loss $\ell = \tfrac{1}{2} \left(t - Q_\theta(s, a)\right)^2$, gradient $-\delta \, \nabla_\theta Q_\theta(s, a)$ only through the prediction
    - $d$ = `terminated`, **not** `terminated || truncated`: a time-limit truncation still bootstraps
 
@@ -56,7 +57,7 @@ classic value-based RL toward DQN. The same learner also runs `CartPole-v1` (see
    $C/2$ for the hard copy, so $\tau = 2/C$ matches it: default $\tau = 0.002 \leftrightarrow C = 1000$.
    Trade-off: no jumps at syncs, but the target is never exactly pinned (the clean label-noise +
    fit-error split above holds only approximately). DDPG / TD3 / SAC use it ($\tau \approx 0.005$).
-   Code: `update_target!`, `fmap` over the parameter trees, blended in place.
+   Code: `update_target!`, `fmap` over the parameter trees; the blend is one compiled program (`Polyak`).
 
 5. **Huber loss.** Per transition, with $\delta = t - Q_\theta(s, a)$ and $q = \min(|\delta|, \kappa)$:
 
@@ -86,8 +87,16 @@ classic value-based RL toward DQN. The same learner also runs `CartPole-v1` (see
    the luckiest error), and bootstrapping propagates that bias backwards. The target network removes
    the *moving* label, not this. With pick and score from different networks, $\theta$'s luck in choosing
    $a^*$ isn't rewarded by $\theta^-$'s value of it. Code: one extra forward pass on $s'$ with $\theta$
-   (outside the gradient), `argmax(Qn; dims=1)` gives a CartesianIndex per column, `Qn⁻[a′]` reads
-   $\theta^-$ there.
+   (outside the gradient). The pick is a mask rather than an argmax + gather, which compiles to plain
+   elementwise ops and reductions:
+
+   $$
+   M_{a i} = \mathbb{1}\left[Q_\theta(s'_i, a) = \max_{a'} Q_\theta(s'_i, a')\right], \qquad
+   V_i = \frac{\sum_a M_{a i} \, Q_{\theta^-}(s'_i, a)}{\sum_a M_{a i}}
+   $$
+
+   which is $Q_{\theta^-}(s'_i, a^*_i)$ whenever the max is unique (an exact tie between float outputs
+   would average over the tied actions).
 
 7. **n-step lookahead** (`n`, default 10). Sum $n$ real rewards, then bootstrap once, $n$ steps later:
 
@@ -110,6 +119,37 @@ classic value-based RL toward DQN. The same learner also runs `CartPole-v1` (see
    computes $t = R + g(1 - d)V$ and never needs $n$. With $n = 1$, $g = \gamma$: identical to plain
    1-step (verified bit-for-bit).
 
+## Reactant + Enzyme
+
+Each piece of device work is a single compiled XLA program, traced on first use and cached:
+
+| program | what | built by |
+|:---|:---|:---|
+| training step | both target forward passes on $s'$, the Huber loss, Enzyme's reverse pass, Adam's update | `Training.single_train_step!(AutoEnzyme(), DDQNLoss(κ), data, ts)` |
+| action | $Q_\theta(s, \cdot)$ on a $d \times 1$ batch | `@compile model(x, θ, st)`, cached in `learner.xla[:q]` |
+| Polyak | $\theta^- \leftarrow \tau\theta + (1 - \tau)\theta^-$ | `@compile Polyak(τ)(θ⁻, θ)`, cached under `(:polyak, τ)` |
+
+- **The objective is a Lux objective**, `(model, θ, st, data) → (ℒ, st′, stats)`, with
+  `data = (s, mask, r, g, d, s′, θ⁻)`. The target is built inside it and wrapped in
+  `Reactant.ignore_derivatives`, so the semi-gradient is exact and Enzyme doesn't differentiate the
+  two extra forward passes.
+- **θ lives in the TrainState** (`learner.ts`, read via `online(l)`). The step may reuse θ's buffers,
+  so nothing keeps a reference to θ across a step. The hard target sync copies (`fmap(copy, θ)`),
+  and the Polyak blend returns new buffers, so θ⁻ never aliases θ.
+- **The host keeps** the Gymnasium env, the replay buffer and minibatch sampling. Each training step
+  copies one minibatch to the device ($(2d + K + 3) B$ floats) and one scalar $\ell$ back.
+- **Compiled programs are fixed** to their shapes and to the constants traced into them: $B$, $\kappa$,
+  $\eta$, $\tau$. Changing $\tau$ compiles a new Polyak program; changing `batch`, `κ` or `η` on an
+  existing learner does not take effect (build a new one). Editing `DDQNLoss` under Revise likewise
+  needs a new learner.
+- **Backend**: `DDQN_BACKEND=cpu` (default) runs on XLA's CPU client, `DDQN_BACKEND=gpu` on CUDA, read
+  once when `ddqn.jl` loads. For $8 \to 64 \to 4$ and $B = 256$ the GPU buys nothing (each call is
+  launch latency). On the GPU, XLA preallocates 75% of memory: set `XLA_REACTANT_GPU_PREALLOCATE=false`
+  to share the card with another job.
+- **Checkpoints** hold host copies only (θ, θ⁻, Adam's $(m, v, \beta_1^t, \beta_2^t)$ per array, η);
+  `load_learner` restores them into a fresh TrainState. Files from the earlier Zygote version (CPU
+  arrays, an `Optimisers` state tree) load the same way.
+
 ## Layout
 
 | File | What |
@@ -119,7 +159,8 @@ classic value-based RL toward DQN. The same learner also runs `CartPole-v1` (see
 | `src/ddqn.jl` | `Learner`, `action`, `on_step!`, `train_batch!`, `run_episode`, `train!`, `infer` |
 | `src/replay.jl` | `Replay` ring buffer (`push!`, `sample`), included by `ddqn.jl` |
 | `src/utils.jl` | helpers, included by `ddqn.jl`: `learning_curve` |
-| `Project.toml` | Julia deps: Lux, Zygote, Optimisers, Functors, PyCall, ProgressMeter, UnicodePlots, Revise, CUDA/cuDNN |
+| `src/checkpoint.jl` | `save_learner`, `load_learner`, included by `ddqn.jl` |
+| `Project.toml` | Julia deps: Lux, Reactant, Enzyme, Optimisers, Functors, PyCall, ProgressMeter, UnicodePlots, CairoMakie, Revise |
 | `pyproject.toml`, `uv.lock` | Python side: `gymnasium[box2d]==1.3.0` in `.venv` |
 
 ## Setup
@@ -241,7 +282,6 @@ $\tau = 0.002$ against the hard copy $C = 1000$.
 - **Threads**: `~/.zshrc` sets `JULIA_NUM_THREADS=auto` (48). Nothing here uses threads, and it
   exposed a Julia 1.12.3 JIT race with the REPL's background hint task (segfault). Run with
   `JULIA_NUM_THREADS=1` or disable hints: `Base.active_repl.options.hint_tab_completes = false`.
-- **First call compiles** (~10–20 s on CPU); stay in one REPL session — Revise recompiles only what
-  you edit.
-- **CPU vs GPU**: `tdev` selects the training device. For this tiny net the CPU is faster (GPU time
-  is kernel-launch overhead); switch `tdev = gdev` once batches / nets are bigger.
+- **First call compiles**: Julia's JIT plus one XLA compile per program (a few seconds each, at the
+  first action and the first training step); stay in one REPL session. Revise recompiles Julia code
+  you edit, but a learner keeps the XLA programs it already built (see *Reactant + Enzyme*).
