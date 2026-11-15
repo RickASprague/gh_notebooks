@@ -6,7 +6,7 @@ Various Jupyter notebooks:
     * `ddqn` — Double DQN (replay, target network, Huber loss, n-step returns), solving LunarLander, CartPole, Acrobot and MountainCar (Julia, Lux, Gymnasium via PyCall).
 * **imagenet64** — models on full ImageNet-64 (1.28M images, 64×64), sharing one set of memory-mapped shards.
   * `autoencoder_io` — Can we make the GPU the bottleneck instead of data loading? Trains a convolutional autoencoder from memory-mapped shards, so there is no per-pass deserialization and no upfront load. Profiles the training step with Nsight Systems and Nsight Compute, measures reconstruction quality, and simulates 5-way data-parallel training on one GPU (Julia, markdown + scripts).
-  * `classifier` — The supervised twin of the autoencoder: same encoder and mmap'd pipeline, with global average pooling and a linear head trained by cross-entropy over the 1000 classes. A simple baseline to build on (Julia, Lux).
+  * `classifier` — A supervised baseline over the 1000 classes: a VGG-style CNN (5.2 M parameters, four stages of 3×3 convs with max-pooling, global average pooling, a linear head) trained by cross-entropy, fed by the shared read-ahead `DataLoader`. 45.7 % top-1 / 70.7 % top-5 after 10 epochs, not yet converged (Julia, Lux).
 * **system_identification** 
     — `coulomb/` identifies Coulomb's law $\dot{\mathbf v} = \alpha\mathbf x/r^3$ with SINDy vs a neural network, and shows where the network fails out of sample (Julia, markdown + scripts).
 * **other** — standalone notes.
