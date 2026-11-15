@@ -5,7 +5,7 @@ from Julia (through PythonCall) takes about 3 minutes, and doing that on every p
 this project removes. This step pays it once: each pickle becomes a flat binary shard that
 [`MMapReader`](../utils/utils.jl) can map at training time without reading or parsing anything.
 
-Run: `julia --project src/preprocess.jl` (needs the raw pickles under `/data/imagenet/Imagenet64`).
+Run from `imagenet64/`: `julia --project=autoencoder_io utils/preprocess.jl` (the converter now lives in the common `../utils/`; needs the raw pickles under `/data/imagenet/Imagenet64`).
 
 ## Format
 

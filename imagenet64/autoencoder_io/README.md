@@ -18,7 +18,6 @@ memory-mapped at training time, so there is no per-pass deserialization and no u
 src/
   shared.jl            shard loader, model, MSE gradient, the normal training loop (used by everything)
   evaluate.jl          validation metrics and figures (used by both reconstruct scripts)
-  preprocess.jl        one-time pickle → mmap shard conversion
   normal/
     train.jl           10-epoch training run
     reconstruct.jl     validation quality and figures
@@ -32,7 +31,8 @@ src/
   data.jl              load_train / load_val for the shards in ../build
   utils.jl             binary serialization and MMapReader (zero-copy mmap views)
   imagenet.jl          pickle loading via PythonCall (preprocessing only)
-../build/              common ImageNet-64 shards (train 59 GB, val 2.3 GB), written by preprocess.jl
+  preprocess.jl        one-time pickle → mmap shard conversion (run with --project=autoencoder_io)
+../build/              common ImageNet-64 shards (train 59 GB, val 2.3 GB), written by ../utils/preprocess.jl
 ```
 
 Run from this folder, e.g. `julia --project src/normal/train.jl`. Outputs go to `build/`

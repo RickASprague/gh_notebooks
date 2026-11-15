@@ -1,15 +1,17 @@
 # One-time conversion: ImageNet-64 Python pickles → flat binary shards that
 # MMapReader can map at training time.
 #
-#   julia --project src/preprocess.jl
+# Common to all imagenet64 projects. Needs PythonCall, which the autoencoder's environment has; run
+# from imagenet64/:
+#   julia --project=autoencoder_io utils/preprocess.jl
 #
 # Needs the raw pickles under ImageNet.IMAGENET_64 (/data/imagenet/Imagenet64).
 # Writes the common imagenet64/build/train/{count,Xs,ys,μs}.ser and build/val/{Xs,ys}.ser.
-# Format per array: [Int32 ndims][Int32 dims...][raw payload] (../utils/utils.jl).
+# Format per array: [Int32 ndims][Int32 dims...][raw payload] (utils.jl).
 
-const ROOT = dirname(@__DIR__)
-include(joinpath(dirname(ROOT), "utils", "imagenet.jl"))
-include(joinpath(dirname(ROOT), "utils", "utils.jl"))
+const IMAGENET64 = dirname(@__DIR__)                # imagenet64/
+include(joinpath(@__DIR__, "imagenet.jl"))
+include(joinpath(@__DIR__, "utils.jl"))
 import .ImageNet
 using .Utils
 
@@ -20,7 +22,7 @@ function load_one(file; has_mean = true)
 end
 
 function fresh_dir(name)
-    base = joinpath(dirname(ROOT), "build", name)   # common imagenet64/build
+    base = joinpath(IMAGENET64, "build", name)       # common imagenet64/build
     ispath(base) && rm(base, force = true, recursive = true)
     mkpath(base)
     return base

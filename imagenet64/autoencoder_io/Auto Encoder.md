@@ -9,7 +9,7 @@ Code lives in `src/`; this document only reports what it produces.
 
 | script | does |
 |---|---|
-| [`src/preprocess.jl`](src/preprocess.jl) | one-time pickle → mmap shard conversion ([Image Preprocess.md](Image%20Preprocess.md)) |
+| [`../utils/preprocess.jl`](../utils/preprocess.jl) | one-time pickle → mmap shard conversion ([Image Preprocess.md](Image%20Preprocess.md)) |
 | [`src/shared.jl`](src/shared.jl) | shard loader and model definition, included by everything else |
 | [`src/normal/train.jl`](src/normal/train.jl) | 10-epoch training run, checkpoints, per-step loss CSV, IO accounting |
 | [`src/normal/reconstruct.jl`](src/normal/reconstruct.jl) | held-out reconstruction quality of the final checkpoint, and all figures |

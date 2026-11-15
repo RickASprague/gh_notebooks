@@ -1,18 +1,23 @@
 # Decision Making
 
-Sequential decision making: an agent chooses actions aₜ in states sₜ to maximize expected return
+Sequential decision making: an agent chooses actions $a_t$ in states $s_t$ to maximize the expected
+return
 
-  G = Σₜ γᵗ rₜ,
+$$
+G = \sum_{t=0}^{\infty} \gamma^t r_t, \qquad 0 \le \gamma \le 1,
+$$
 
-usually framed as a Markov decision process (𝒮, 𝒜, P(s′ | s, a), r, γ). The optimal action-value
-function satisfies the Bellman optimality equation
+usually framed as a Markov decision process $(\mathcal{S}, \mathcal{A}, P(s' \mid s, a), r, \gamma)$.
+The optimal action-value function satisfies the Bellman optimality equation
 
-  Q*(s, a) = 𝔼[ r + γ maxₐ′ Q*(s′, a′) | s, a ].
+$$
+Q^*(s, a) = \mathbb{E}\left[\, r + \gamma \max_{a'} Q^*(s', a') \;\middle|\; s, a \,\right].
+$$
 
-Two branches, split by whether the model P is used:
+Two branches, split by whether the model $P$ is used:
 
-- **`rl/`**: reinforcement learning, model-free. Learn Q (or a policy) from sampled transitions only.
-- planning (model-based, e.g. MCTS): search with a model of P. Not here yet.
+- **`rl/`**: reinforcement learning, model-free. Learn $Q$ (or a policy) from sampled transitions only.
+- planning (model-based, e.g. MCTS): search with a model of $P$. Not here yet.
 
 ## Projects
 

@@ -1,7 +1,7 @@
 # Common to every imagenet64 project: the ImageNet-64 shards and their loaders. Nothing model- or
 # evaluation-specific lives here.
 #
-# Shards: imagenet64/build/{train,val}, written once by autoencoder_io/src/preprocess.jl.
+# Shards: imagenet64/build/{train,val}, written once by utils/preprocess.jl.
 #
 #   include(joinpath(<imagenet64>, "utils", "data.jl"))
 #   N, ys, Xs, μs = load_train()     # 10 shards: Xs[k] is a (64,64,3,Nk) mmapped view, ys[k] labels 1..1000
