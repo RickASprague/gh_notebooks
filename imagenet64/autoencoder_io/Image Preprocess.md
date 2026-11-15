@@ -3,7 +3,7 @@
 ImageNet-64 ships as Python pickles of NumPy arrays. Unpickling and converting all 1.28M images
 from Julia (through PythonCall) takes about 3 minutes, and doing that on every pass is the IO cost
 this project removes. This step pays it once: each pickle becomes a flat binary shard that
-[`MMapReader`](lib/utils.jl) can map at training time without reading or parsing anything.
+[`MMapReader`](../utils/utils.jl) can map at training time without reading or parsing anything.
 
 Run: `julia --project src/preprocess.jl` (needs the raw pickles under `/data/imagenet/Imagenet64`).
 
@@ -26,10 +26,10 @@ needs, `X[:, :, :, i:j]`, is one contiguous run of $64\cdot 64\cdot 3\cdot 4 = 4
 
 | file | contents |
 |---|---|
-| `build/train/count.ser` | number of shards (10) |
-| `build/train/Xs.ser` | images, Float32 in $[0,1]$, $(64,64,3,N_k)$ per shard — 63 GB |
-| `build/train/ys.ser` | Int64 class labels per shard |
-| `build/train/μs.ser` | per-shard channel means $(64,64,3)$ |
-| `build/val/Xs.ser`, `ys.ser` | 50,000 validation images, one shard, no mean |
+| `../build/train/count.ser` | number of shards (10) |
+| `../build/train/Xs.ser` | images, Float32 in $[0,1]$, $(64,64,3,N_k)$ per shard — 63 GB |
+| `../build/train/ys.ser` | Int64 class labels per shard |
+| `../build/train/μs.ser` | per-shard channel means $(64,64,3)$ |
+| `../build/val/Xs.ser`, `ys.ser` | 50,000 validation images, one shard, no mean |
 
 The training set is 10 pickles (2 parts × 5 batches) of about 128k images each, 1,281,167 in total.

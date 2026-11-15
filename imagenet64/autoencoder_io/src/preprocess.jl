@@ -4,12 +4,12 @@
 #   julia --project src/preprocess.jl
 #
 # Needs the raw pickles under ImageNet.IMAGENET_64 (/data/imagenet/Imagenet64).
-# Writes build/train/{count,Xs,ys,μs}.ser and build/val/{Xs,ys}.ser.
-# Format per array: [Int32 ndims][Int32 dims...][raw payload] (lib/utils.jl).
+# Writes the common imagenet64/build/train/{count,Xs,ys,μs}.ser and build/val/{Xs,ys}.ser.
+# Format per array: [Int32 ndims][Int32 dims...][raw payload] (../utils/utils.jl).
 
 const ROOT = dirname(@__DIR__)
-include(joinpath(ROOT, "lib", "imagenet.jl"))
-include(joinpath(ROOT, "lib", "utils.jl"))
+include(joinpath(dirname(ROOT), "utils", "imagenet.jl"))
+include(joinpath(dirname(ROOT), "utils", "utils.jl"))
 import .ImageNet
 using .Utils
 
@@ -20,7 +20,7 @@ function load_one(file; has_mean = true)
 end
 
 function fresh_dir(name)
-    base = joinpath(ROOT, "build", name)
+    base = joinpath(dirname(ROOT), "build", name)   # common imagenet64/build
     ispath(base) && rm(base, force = true, recursive = true)
     mkpath(base)
     return base

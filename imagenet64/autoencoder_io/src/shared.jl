@@ -1,4 +1,5 @@
-# Shared by every script: the mmap'd ImageNet-64 shards and the autoencoder.
+# Shared by every autoencoder script: the model, its loss and training loop. Data loading is common to
+# all imagenet64 projects (../utils/data.jl, shards in ../build).
 #
 # All paths are relative to the project root (autoencoder_io/), so scripts can
 # be run from anywhere:  julia --project src/<script>.jl
@@ -13,44 +14,7 @@ const RESOURCES = joinpath(ROOT, "resources")
 const CHKPT_DIR    = joinpath(BUILD, "checkpoint")      # normal/train.jl
 const CHKPT_DIR_DP = joinpath(BUILD, "checkpoint_dp")   # data_parallel/train.jl, data-parallel run
 
-include(joinpath(ROOT, "lib", "utils.jl"))
-using .Utils
-
-# Training shards. MMapReader maps Xs.ser once and hands back reshape'd views
-# into the mapped buffer: no read, no parse, no copy. Labels and means are tiny
-# and go through plain IO.
-function load_train()
-    base = joinpath(BUILD, "train")
-    open(joinpath(base, "count.ser"), "r") do io
-        N  = deserialize(io, Int64)                         # number of shards
-        Xs = Vector{AbstractArray{Float32, 4}}(undef, N)    # (64,64,3,Nk) views
-        μs = Vector{AbstractArray{Float32, 3}}(undef, N)
-        ys = Vector{Vector{Int}}(undef, N)
-
-        yf = open(joinpath(base, "ys.ser"), "r")
-        Xf = MMapReader(joinpath(base, "Xs.ser"))
-        μf = open(joinpath(base, "μs.ser"), "r")
-        count = 0
-        for i ∈ 1:N
-            Xs[i] = deserialize(Xf, Array{Float32})
-            μs[i] = deserialize(μf, Array{Float32})
-            ys[i] = deserialize(yf, Array{Int64})
-            count += length(ys[i])
-        end
-        close(yf); close(Xf); close(μf)
-        return count, ys, Xs, μs
-    end
-end
-
-# Validation: one shard of 50k, same format, no means.
-function load_val()
-    base = joinpath(BUILD, "val")
-    Xf = MMapReader(joinpath(base, "Xs.ser"))
-    X  = deserialize(Xf, Array{Float32})
-    close(Xf)
-    y = open(io -> deserialize(io, Array{Int64}), joinpath(base, "ys.ser"))
-    return y, X
-end
+include(joinpath(dirname(ROOT), "utils", "data.jl"))   # common: shards + load_train / load_val
 
 # Symmetric conv / deconv, stride-2 at every stage.
 #   encoder: 64x64x3 → 32x32x32 → 16x16x64 → 8x8x128 → 4x4x256

@@ -28,13 +28,15 @@ src/
     verify.jl          arithmetic checks
     train.jl           simulated 5-GPU run (10 epochs, saves the model), baseline, reassembly
     reconstruct.jl     validation quality and figures for the data-parallel model
-lib/
+../utils/              common to all imagenet64 projects: data and loading only
+  data.jl              load_train / load_val for the shards in ../build
   utils.jl             binary serialization and MMapReader (zero-copy mmap views)
   imagenet.jl          pickle loading via PythonCall (preprocessing only)
+../build/              common ImageNet-64 shards (train 59 GB, val 2.3 GB), written by preprocess.jl
 ```
 
 Run from this folder, e.g. `julia --project src/normal/train.jl`. Outputs go to `build/`
-(checkpoints, shards) and `results/` (logs, CSVs, profiler reports); figures go to `resources/`.
+(checkpoints; the shards are in the common `../build/`) and `results/` (logs, CSVs, profiler reports); figures go to `resources/`.
 
 ## Results
 

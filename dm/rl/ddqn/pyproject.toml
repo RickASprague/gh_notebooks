@@ -1,0 +1,16 @@
+[project]
+name = "lundar-lander-py"
+version = "0.1.0"
+description = "Python side for the Julia Lunar Lander: Gymnasium + Box2D, called from Julia via PyCall"
+requires-python = "==3.12.*"
+dependencies = [
+    # [box2d] pulls the box2d 2.3.10 wheel and pygame (needed for render_mode="human")
+    "gymnasium[box2d]==1.3.0",
+]
+
+[tool.uv]
+package = false
+# System /usr/bin/python3.12, NOT a uv-managed CPython: PyCall dlopens libpython, and the
+# python-build-standalone libpython is linked with an executable stack, which glibc ≥ 2.41 refuses
+# to dlopen ("cannot enable executable stack"). Ubuntu's libpython3.12.so.1.0 loads fine.
+python-preference = "only-system"

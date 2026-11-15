@@ -20,8 +20,8 @@ scripts are in `src/data_parallel/` ([Auto Encoder - Data Parallel.md](Auto%20En
 
 ## Data loading
 
-The preprocessed shards (63 GB of Float32 in `build/train/Xs.ser`) are memory-mapped rather than
-read. `MMapReader` ([`lib/utils.jl`](lib/utils.jl)) maps the file once and returns each shard as
+The preprocessed shards (63 GB of Float32 in the common `../build/train/Xs.ser`) are memory-mapped rather than
+read. `MMapReader` ([`../utils/utils.jl`](../utils/utils.jl)) maps the file once and returns each shard as
 `reshape(reinterpret(Float32, view(buf, a:b)), 64, 64, 3, Nₖ)`, a view into the mapping, so
 "loading" means parsing ten small headers:
 
