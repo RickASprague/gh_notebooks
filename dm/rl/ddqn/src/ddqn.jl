@@ -9,20 +9,14 @@
 
 using PyCall
 using Lux, Random
-using Reactant, Enzyme, Optimisers       # trace → MLIR → XLA; Enzyme for ∇ of the loss; Adam
+using Optimisers, Zygote                 # Adam, and ∇ of the loss w.r.t. the parameters
 using Functors                           # fmap over the (nested NamedTuple) parameter trees
 using ProgressMeter                      # live-updating progress bar for train!()
+using CUDA, cuDNN                        # loaded so gpu_device() finds the GPU
 
-# Every array the network touches (p, p⁻, Adam's moments, each minibatch) lives on the XLA backend
-# chosen here, and every computation on them is a compiled XLA program (see `compiled!`).
-#   DDQN_BACKEND=cpu (default)  XLA's CPU client. The net is 8→64→4: a GPU step would be launch latency.
-#   DDQN_BACKEND=gpu            CUDA. XLA preallocates 75% of the GPU; XLA_REACTANT_GPU_PREALLOCATE=false
-#                               to share it with another job.
-# Must be set before the first array is moved: arrays belong to the client they were made on.
-const BACKEND = get(ENV, "DDQN_BACKEND", "cpu")
-Reactant.set_default_backend(BACKEND)
 const cdev = cpu_device()
-const rdev = reactant_device()
+const gdev = gpu_device()        # switch here; pays off only with batches / bigger nets
+const tdev = cdev                # training device: where p, st and the forward/backward live
 
 include("utils.jl")             # PlotStyle, learning_curve (Unicode), learning_curve_figure (Makie), show_curve
 include("replay.jl")            # Replay ring buffer: push!, sample
@@ -38,7 +32,7 @@ function run_episode(env, learner; seed=nothing, max_steps=1000, learn=true)
     nℒ = 0                       # number of gradient steps this episode
     for t ∈ 1:max_steps
         a = action(learner, obs)                                   # act: no gradient
-        obs′, r, terminated, truncated, _ = env.step(a - 1)        # Python, host side
+        obs′, r, terminated, truncated, _ = env.step(a - 1)        # Python: outside Zygote entirely
         obs′ = Float32.(obs′)
         timeout = truncated || t == max_steps                      # our own cap ends the episode too
         ℓ = learn ? on_step!(learner, obs, a, r, obs′, terminated, timeout) : NaN   # store; maybe one batch step
@@ -55,16 +49,12 @@ end
 
 # Fields are grouped by upgrade. Hyperparameters carry their defaults here; the rest (network
 # parameters, buffer, optimiser state) are built by the Learner(model; ...) constructor below.
-#
-# The online parameters θ, the layer states and Adam's moments live in `ts`, a Lux TrainState; read
-# θ as `online(l)`. Never keep θ in a variable across a training step: the step may reuse (donate)
-# its buffers. `ts` is untyped because its type changes once the first step caches the compiled program.
-Base.@kwdef mutable struct Learner{M, P<:NamedTuple}
+Base.@kwdef mutable struct Learner{M, P<:NamedTuple, S<:NamedTuple, O}
     envname::EnvName = LUNAR_LANDER   # which problem: sets d, K (envs.jl), outcome labels, plot
     model::M                      # Q_θ : ℝᵈ → ℝᴷ, must match spec(envname)
     γ::Float32 = 0.99f0
-    η::Float32 = 1f-2             # Adam step size (fixed once the first training step compiles)
-    ts::Training.TrainState       # online parameters θ (trained, used to act), states, Adam's state
+    p::P                          # online parameters θ: trained, used to act
+    st::S
 
 	# epsilon annealing
     ε::Float32 = NaN32            # ε-greedy: 1 = always random, 0 = always greedy (current value; starts at ε₀)
@@ -93,19 +83,21 @@ Base.@kwdef mutable struct Learner{M, P<:NamedTuple}
     κ::Float32 = 30f0             # Huber threshold: quadratic for |δ| ≤ κ, linear beyond (large κ, e.g. 1f6 = plain squared loss)
     steps::Int = 0                # env steps seen so far
     returns::Vector{Float64} = Float64[]   # every training episode's return G, across train!() calls
-    xla::Dict{Any, Any} = Dict{Any, Any}() # compiled XLA programs, built on first use (`compiled!`)
+    opt_state::O                  # Adam's per-parameter moments (m, v), same tree shape as p
 end
 
-# Build a Learner around a Lux model. Every keyword except capacity is a field name (defaults
+# Build a Learner around a Lux model. Every keyword except η and capacity is a field name (defaults
 # above), so Learner(model; n=3, polyak=true) sets exactly those fields.
+#   η        Adam step size (lives inside opt_state, not a field)
 #   capacity replay buffer size
-# envname and η are fields too, but the constructor needs them up front (buffer size d, Adam).
+# envname is a field too, but the constructor needs it up front for the buffer's state size d.
 function Learner(model; η=1f-2, capacity=50_000, envname=LUNAR_LANDER, kw...)
-    p, st = Lux.setup(Xoshiro(0), model) |> rdev
-    ts = Training.TrainState(model, p, st, Optimisers.Adam(Float32(η)))
+    p, st = Lux.setup(Xoshiro(0), model) .|> tdev
+    opt_state = Optimisers.setup(Optimisers.Adam(η), p)
     # explicit type parameters → Julia converts each keyword to its field type (e.g. τ=0.01 → Float32)
-    l = Learner{typeof(model), typeof(p)}(;
-            envname, model, η, ts, p⁻=fmap(copy, p), buffer=Replay(capacity, spec(envname).obs), kw...)
+    l = Learner{typeof(model), typeof(p), typeof(st), typeof(opt_state)}(;
+            envname, model, p, st, p⁻=deepcopy(p), buffer=Replay(capacity, spec(envname).obs),
+            opt_state, kw...)
     l.ε = l.ε₀                                            # annealing starts at ε₀
     0 < l.γ ≤ 1 || throw(ArgumentError("γ must be in (0, 1]"))
     0 ≤ l.ε_min ≤ l.ε₀ ≤ 1 || throw(ArgumentError("need 0 ≤ ε_min ≤ ε₀ ≤ 1"))
@@ -121,24 +113,13 @@ anneal!(l::Learner, k) = (l.ε = max(l.ε_min, l.ε₀ - (l.ε₀ - l.ε_min) * 
 # instead of the full parametric type plus every weight array.
 Base.show(io::IO, ::MIME"text/plain", ::Learner) = nothing
 Base.show(io::IO, l::Learner) =
-    print(io, "Learner(γ=$(l.γ), ε=$(round(l.ε; digits=3)), $(Lux.parameterlength(online(l))) params)")
+    print(io, "Learner(γ=$(l.γ), ε=$(round(l.ε; digits=3)), $(Lux.parameterlength(l.p)) params)")
 
-online(l::Learner) = l.ts.parameters      # θ, on the XLA device
-
-# The compiled program stored under `key`, building it with `build()` the first time. A program is
-# fixed to its argument shapes and to the constants baked in when it was traced; `key` names the
-# constants that may change (e.g. τ), so changing one compiles a new program instead of reusing a stale one.
-compiled!(build, l::Learner, key) = get!(build, l.xla, key)
-
-# ε-greedy on Q_θ(s, ·). Compiled forward pass on a d × 1 batch: nothing here is differentiated.
+# ε-greedy on Q_p(s, ·). Plain forward pass with learner.p: nothing here is differentiated.
 function action(learner::Learner, obs)
     rand() < learner.ε && return rand(1:spec(learner.envname).actions)     # uniform over K
-    x = rdev(reshape(obs, :, 1))
-    q = compiled!(learner, :q) do
-        @compile learner.model(x, online(learner), learner.ts.states)
-    end
-    Q, _ = q(x, online(learner), learner.ts.states)                # Lux returns (y, st′)
-    return argmax(vec(Array(Q)))
+    Q, _ = learner.model(obs |> tdev, learner.p, learner.st)       # Lux returns (y, st′)
+    return argmax(Q |> cdev)
 end
 
 # Pop the oldest queued (s₀, a₀) and store it as an m-step transition, m = length(queue):
@@ -174,21 +155,13 @@ end
 # Target network θ⁻, one of two ways:
 #   hard:   every C = target_every env steps, θ⁻ ← θ               (sample-and-hold: flat, then a jump)
 #   polyak: every env step, θ⁻ ← τθ + (1 − τ)θ⁻                     (EMA: θ⁻ = τ Σₖ (1 − τ)ᵏ θₜ₋ₖ, creeps)
-# The blend is one compiled program with τ baked in; fmap walks p⁻ and θ in parallel, leaf = one
-# weight array. Both ways p⁻ gets fresh device buffers, never aliases of θ's.
-struct Polyak
-    τ::Float32
-end
-(b::Polyak)(p⁻, p) = fmap((w⁻, w) -> b.τ .* w .+ (1 - b.τ) .* w⁻, p⁻, p)
-
+# fmap walks p⁻ and p in parallel, leaf = one weight array; the blend is in place (p⁻ never aliases p).
 function update_target!(learner::Learner)
     if learner.polyak
-        blend = compiled!(learner, (:polyak, learner.τ)) do
-            @compile Polyak(learner.τ)(learner.p⁻, online(learner))
-        end
-        learner.p⁻ = blend(learner.p⁻, online(learner))
+        τ = learner.τ
+        fmap((w⁻, w) -> (w⁻ .= τ .* w .+ (1 - τ) .* w⁻), learner.p⁻, learner.p)
     elseif learner.steps % learner.target_every == 0
-        learner.p⁻ = fmap(copy, online(learner))
+        learner.p⁻ = deepcopy(learner.p)
     end
     return learner
 end
@@ -203,44 +176,32 @@ function huber(δ, κ)
 end
 
 # One semi-gradient Q-learning step on a random minibatch, Double DQN target:
-#   a*ᵢ = argmaxₐ′ Q_θ(s′ᵢ, a′)                  (online θ PICKS the next action)
-#   tᵢ  = rᵢ + gᵢ (1 − dᵢ) Q_θ⁻(s′ᵢ, a*ᵢ)         (frozen θ⁻ SCORES it; constant; gᵢ = γᵐ, γ for 1-step)
-#   ℒ  = (1/B) Σᵢ h(tᵢ − Q_θ(sᵢ, aᵢ))             (Huber; differentiated w.r.t. θ)
-#
-# As a Lux objective (model, θ, st, data) → (ℒ, st′, stats), so the whole step (both target forward
-# passes, the loss, Enzyme's reverse pass and Adam's update) is ONE compiled XLA program.
-#   PICK  without argmax/gather: Mᵢ = 1[Q_θ(s′ᵢ, ·) = maxₐ′ Q_θ(s′ᵢ, a′)] ∈ {0,1}ᴷ, then
-#         Vnᵢ = ⟨Mᵢ, Q_θ⁻(s′ᵢ, ·)⟩ / ‖Mᵢ‖₁, which is Q_θ⁻(s′ᵢ, a*ᵢ) unless the max is tied (then the
-#         mean over the tied actions; ties between float outputs don't happen in practice).
-#   t is a constant: ignore_derivatives stops the gradient (it would be zero through the argmax
-#   anyway, but this keeps Enzyme from differentiating the two extra forward passes).
-# κ is baked in when the step first compiles.
-struct DDQNLoss
-    κ::Float32
-end
-
-function (o::DDQNLoss)(model, p, st, (s, mask, r, g, d, s′, p⁻))
-    Qn⁻, _ = model(s′, p⁻, st)                                     # Q_θ⁻(s′, ·), K × B: SCORE
-    Qn, _ = model(s′, p, st)                                       # Q_θ(s′, ·),  K × B: PICK
-    M = Float32.(Qn .== maximum(Qn; dims=1))                       # one-hot of a*ᵢ per column
-    Vn = vec(sum(M .* Qn⁻; dims=1) ./ sum(M; dims=1))              # θ⁻'s value of θ's choice
-    t = Reactant.ignore_derivatives(r .+ g .* (1 .- d) .* Vn)      # tᵢ = Rᵢ + gᵢ(1 − dᵢ)Vnᵢ, gᵢ = γᵐ
-    Q, st′ = model(s, p, st)                                       # K × B
-    Q_sa = vec(sum(Q .* mask; dims=1))                             # Q(sᵢ, aᵢ): pick row aᵢ in column i
-    return sum(huber.(t .- Q_sa, o.κ)) / size(Q, 2), st′, (;)
-end
-
-# Sampling stays on the host (the buffer is plain arrays); one host → device copy of the minibatch,
-# one compiled step, one device → host copy of the scalar ℒ.
+#   a*ᵢ = argmaxₐ′ Q_p(s′ᵢ, a′)                  (online θ PICKS the next action)
+#   tᵢ  = rᵢ + gᵢ (1 − dᵢ) Q_p⁻(s′ᵢ, a*ᵢ)         (frozen θ⁻ SCORES it; constant; gᵢ = γᵐ, γ for 1-step)
+#   ℒ  = (1/B) Σᵢ h(tᵢ − Q_p(sᵢ, aᵢ))             (Huber; differentiated w.r.t. p)
 function train_batch!(learner::Learner)
     b = sample(learner.buffer, learner.batch)
     B = learner.batch
-    K = spec(learner.envname).actions
+
+    s′ = b.s′ |> tdev
+    Qn⁻, _ = learner.model(s′, learner.p⁻, learner.st)             # Q_θ⁻(s′, ·), K × B: SCORE
+    Qn, _ = learner.model(s′, learner.p, learner.st)               # Q_θ(s′, ·),  K × B: PICK (no gradient)
+    K = size(Qn, 1)
+    a′ = argmax(Qn; dims=1)                                        # 1 × B CartesianIndex (a*ᵢ, i)
+    Vn = vec(Qn⁻[a′])                                              # θ⁻'s value of θ's choice
+    t = (b.r |> tdev) .+ (b.g |> tdev) .* (1 .- (b.d |> tdev)) .* Vn   # tᵢ = Rᵢ + gᵢ(1 − dᵢ)Vnᵢ, gᵢ = γᵐ
+
     onehot = zeros(Float32, K, B)                                  # column i has a 1 in row aᵢ
     onehot[CartesianIndex.(b.a, 1:B)] .= 1
-    data = (rdev((b.s, onehot, b.r, b.g, b.d, b.s′))..., learner.p⁻)
-    _, ℒ, _, learner.ts = Training.single_train_step!(AutoEnzyme(), DDQNLoss(learner.κ), data, learner.ts)
-    return Float32(ℒ)
+    x, mask = b.s |> tdev, onehot |> tdev
+
+    ℒ, (∇,) = Zygote.withgradient(learner.p) do p
+        Q, _ = learner.model(x, p, learner.st)                     # K × B
+        Q_sa = vec(sum(Q .* mask; dims=1))                         # Q(sᵢ, aᵢ): pick row aᵢ in column i
+        sum(huber.(t .- Q_sa, learner.κ)) / B
+    end
+    learner.opt_state, learner.p = Optimisers.update!(learner.opt_state, learner.p, ∇)
+    return ℒ
 end
 
 # plots: a PlotStyle (NoPlot, UnicodePlot, MakiePlot, BothPlots) or Bool (true = UnicodePlot).

@@ -4,14 +4,16 @@
 #   julia -t 4 --project src/train.jl 10 20      # smoke test: 10 epochs capped at 20 steps each
 #   BATCH=512 julia -t 4 --project src/train.jl  # batch size (default 1024; 512 fits a 12 GB GPU)
 #   MODEL=resnet18 julia -t 4 --project src/train.jl   # network: vgg (default) or resnet18
+#   PRECISION=bf16 julia -t 4 --project src/train.jl   # BF16 mixed precision (default fp32)
 #
 # Data and loading are common to all imagenet64 projects (../utils/data.jl, ../utils/dataloader.jl,
 # shards in ../build); the same code runs on the Threadripper and the NAS. -t 4 lets the loader's
 # reader thread overlap with training.
 #
 # Writes build/checkpoint/model_<epoch>.jld2 and results/train_{epochs,loss}.csv; models other
-# than the default get a suffix (build/checkpoint-resnet18/, results/train_epochs-resnet18.csv).
-# TensorBoard logs go to build/tensorboard/<model>-b<batch>-<time>/ while training runs:
+# than the default get a suffix (build/checkpoint-resnet18/, results/train_epochs-resnet18.csv),
+# and so does a non-default precision (-bf16).
+# TensorBoard logs go to build/tensorboard/<model>[-bf16]-b<batch>-<time>/ while training runs:
 #
 #   tensorboard --logdir build/tensorboard          # then http://localhost:6006
 
@@ -21,7 +23,12 @@ using TensorBoardLogger
 
 const ROOT      = dirname(@__DIR__)
 const MODEL     = get(ENV, "MODEL", "vgg")
-const TAG       = MODEL == "vgg" ? "" : "-$MODEL"
+const PRECISION = get(ENV, "PRECISION", "fp32")             # fp32 or bf16
+const PTAG      = PRECISION == "fp32" ? "" : "-$PRECISION"
+# A run limited to a few steps (second argument) is a smoke test: its outputs get a -smoke tag
+# so they never overwrite a full run's results, checkpoints or TensorBoard log.
+const STAG      = length(ARGS) ≥ 2 ? "-smoke" : ""
+const TAG       = (MODEL == "vgg" ? "" : "-$MODEL") * PTAG * STAG
 const RESULTS   = joinpath(ROOT, "results")
 const CHKPT_DIR = joinpath(ROOT, "build", "checkpoint$TAG")
 const TB_DIR    = joinpath(ROOT, "build", "tensorboard")
@@ -45,6 +52,54 @@ function ce_grad(model, ps, st0, xb, Yb)
         crossentropy(z, Yb), st1
     end
     ∇, = back((one(ℓ), nothing))
+    return ∇, ℓ, st1
+end
+
+# BF16 mixed precision: the step's forward and backward run on BF16 copies, the weights, Adam's
+# moments and the BatchNorm statistics stay FP32.
+#
+#   ps32 → bf16 → forward/backward (tensor cores, half the activation bytes) → ∇ in BF16 → FP32
+#   → Adam on ps32.
+#
+# The weights are the FP32 part because they accumulate many tiny updates: near |w| = 0.5 one BF16
+# ulp is 2⁻⁸ ≈ 4e-3, so a 1e-3 Adam step would round away. All conversions run on the GPU: Julia's
+# CPU BF16 conversion crashes LLVM on this machine (Zen 4).
+#
+# Only the convolutional body runs in BF16. The head (global pool, dropout, Dense, and the softmax
+# after it) runs in FP32 on FP32 weights: it is ~0.5 M multiply-adds per image against ~2.2 G for
+# the body, the logits and softmax want FP32 anyway, and LuxLib's fused BF16 Dense (cuBLASLt matmul
+# with a bias epilogue) fails its algorithm search with CUBLAS_STATUS_INVALID_VALUE.
+to_bf16(x) = Lux.bf16(x)
+to_f32(t) = Lux.fmap(x -> x isa AbstractArray ? Float32.(x) : x, t)
+
+# Split a model's top-level Chain into body (all layers but the last) and head (the last layer).
+# Both networks in model.jl end in `head(...)`. Cached per model, since Chain construction is cheap
+# but needn't run every step.
+const _SPLIT = IdDict{Any, Any}()
+function split_head(model)
+    get!(_SPLIT, model) do
+        ks = keys(model.layers)
+        bk = ks[1:end-1]
+        (; body = Chain(NamedTuple{bk}(map(k -> model.layers[k], bk))), bk, hk = ks[end])
+    end
+end
+pick(nt, ks) = NamedTuple{ks}(map(k -> nt[k], ks))
+
+function ce_grad_bf16(model, ps32, st32, xb, Yb)
+    (; body, bk, hk) = split_head(model)
+    head = model.layers[hk]
+    psb, stb = to_bf16(pick(ps32, bk)), to_bf16(pick(st32, bk))   # body: BF16 copies
+    psh, sth = ps32[hk], st32[hk]                                  # head: FP32 as is
+    x16 = to_bf16(xb)
+    (ℓ, (stb1, sth1)), back = Zygote.pullback(psb, psh) do pb, ph
+        local f, stb1 = Lux.apply(body, x16, pb, stb)              # BF16 features
+        local z, sth1 = Lux.apply(head, Float32.(f), ph, sth)      # FP32 head → FP32 logits
+        crossentropy(z, Yb), (stb1, sth1)
+    end
+    ∇b, ∇h = back((one(ℓ), nothing))
+    ks = (bk..., hk)                                               # same key order as ps32
+    ∇   = NamedTuple{ks}((map(k -> to_f32(∇b[k]), bk)..., ∇h))
+    st1 = NamedTuple{ks}((map(k -> to_f32(stb1[k]), bk)..., sth1))
     return ∇, ℓ, st1
 end
 
@@ -77,10 +132,18 @@ function evaluate(model, ps, st, y, X; batch = BATCH)
 end
 
 # The training loop. Returns (per-step losses, epoch table [epoch loss top1 top5 seconds img/s], ps, st).
-# With a TBLogger `tb`, logs train/loss every step, train/img_per_s every 50 steps, and
-# val/top1, val/top5, train/epoch_loss, time/epoch_s every epoch, against the global step.
+# With a TBLogger `tb`, logs against the global step:
+#   every step       train/loss
+#   every 50 steps   train/img_per_s
+#   every 500 steps  val_subset/top1, val_subset/top5 on a fixed 5 000-image slice of val (cheap,
+#                    dense; its time is excluded from epoch time and throughput)
+#   every epoch      val/top1, val/top5 (all 50 000), train/epoch_loss, time/epoch_s
+const SUBSET_EVERY = 500
+const SUBSET_N     = 5_000
+
 function train(model, loader, yv, Xv; nepochs, lr = 1f-3, on_epoch = (epoch, ps, st) -> nothing,
-               tb = nothing)
+               tb = nothing, grad = ce_grad)
+    ys_sub, Xs_sub = yv[1:SUBSET_N], view(Xv, :, :, :, 1:SUBSET_N)
     dev = gpu_device()
     rng = Random.default_rng(); Random.seed!(rng, 0)
     ps, st = Lux.setup(rng, model)
@@ -97,11 +160,11 @@ function train(model, loader, yv, Xv; nepochs, lr = 1f-3, on_epoch = (epoch, ps,
     t_rate = time(); n_rate = 0                  # throughput window for train/img_per_s
     for epoch ∈ 1:nepochs
         eloss = 0f0; nb = 0
-        t0 = time()
+        t0 = time(); t_sub = 0.0                 # t_sub: subset-evaluation time, not training
         for (x, y) ∈ loader
             copyto!(xb_gpu, x)
             copyto!(Yb_gpu, onehot!(Yb_host, y))
-            ∇, ℓ, st = ce_grad(model, ps, st, xb_gpu, Yb_gpu)
+            ∇, ℓ, st = grad(model, ps, st, xb_gpu, Yb_gpu)   # ce_grad, or ce_grad_bf16
             opt_state, ps = Optimisers.update(opt_state, ps, ∇)
             push!(batch_loss, ℓ)
             eloss += ℓ; nb += 1; step += 1; n_rate += 1
@@ -111,9 +174,17 @@ function train(model, loader, yv, Xv; nepochs, lr = 1f-3, on_epoch = (epoch, ps,
                     log_value(tb, "train/img_per_s", n_rate * loader.batch / (time() - t_rate); step)
                     t_rate = time(); n_rate = 0
                 end
+                if step % SUBSET_EVERY == 0
+                    te = time()
+                    s1, s5 = evaluate(model, ps, st, ys_sub, Xs_sub)
+                    log_value(tb, "val_subset/top1", 100s1; step)
+                    log_value(tb, "val_subset/top5", 100s5; step)
+                    de = time() - te
+                    t_sub += de; t_rate += de            # keep it out of epoch time and img/s
+                end
             end
         end
-        dt = time() - t0
+        dt = time() - t0 - t_sub
         ips = nb * loader.batch / dt
         top1, top5 = evaluate(model, ps, st, yv, Xv)
         epochs = vcat(epochs, [epoch eloss/nb top1 top5 dt ips])
@@ -150,12 +221,15 @@ if abspath(PROGRAM_FILE) == @__FILE__
         jldsave(joinpath(CHKPT_DIR, "model_$epoch.jld2");
                 parameters = ps |> cpu_device(), state = st |> cpu_device())
 
-    runname = "$MODEL-b$BATCH-" * Dates.format(now(), "yyyymmdd-HHMM")
+    grad = PRECISION == "bf16" ? ce_grad_bf16 :
+           PRECISION == "fp32" ? ce_grad : error("PRECISION must be fp32 or bf16, got $PRECISION")
+    @info "precision" PRECISION
+    runname = "$MODEL$PTAG$STAG-b$BATCH-" * Dates.format(now(), "yyyymmdd-HHMM")
     tb      = TBLogger(joinpath(TB_DIR, runname), tb_overwrite)
     @info "TensorBoard" logdir = joinpath(TB_DIR, runname)
 
     @info "Training"
-    @time batch_loss, epochs, _, _ = train(model, loader, yv, Xv; nepochs, on_epoch = save_checkpoint, tb)
+    @time batch_loss, epochs, _, _ = train(model, loader, yv, Xv; nepochs, on_epoch = save_checkpoint, tb, grad)
 
     writedlm(joinpath(RESULTS, "train_loss$TAG.csv"), batch_loss, ',')
     writedlm(joinpath(RESULTS, "train_epochs$TAG.csv"),

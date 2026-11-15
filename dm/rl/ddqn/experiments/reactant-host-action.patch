@@ -1,0 +1,91 @@
+diff --git a/dm/rl/ddqn/README.md b/dm/rl/ddqn/README.md
+index a6f22f5..6ecfbd3 100644
+--- a/dm/rl/ddqn/README.md
++++ b/dm/rl/ddqn/README.md
+@@ -121,12 +121,12 @@ classic value-based RL toward DQN. The same learner also runs `CartPole-v1` (see
+ 
+ ## Reactant + Enzyme
+ 
+-Each piece of device work is a single compiled XLA program, traced on first use and cached:
++Training-side device work is a single compiled XLA program per piece, traced on first use and
++cached; acting is plain Julia on a host copy of θ:
+ 
+ | program | what | built by |
+ |:---|:---|:---|
+ | training step | both target forward passes on $s'$, the Huber loss, Enzyme's reverse pass, Adam's update | `Training.single_train_step!(AutoEnzyme(), DDQNLoss(κ), data, ts)` |
+-| action | $Q_\theta(s, \cdot)$ on a $d \times 1$ batch | `@compile model(x, θ, st)`, cached in `learner.xla[:q]` |
+ | Polyak | $\theta^- \leftarrow \tau\theta + (1 - \tau)\theta^-$ | `@compile Polyak(τ)(θ⁻, θ)`, cached under `(:polyak, τ)` |
+ 
+ - **The objective is a Lux objective**, `(model, θ, st, data) → (ℒ, st′, stats)`, with
+@@ -138,6 +138,16 @@ Each piece of device work is a single compiled XLA program, traced on first use
+   and the Polyak blend returns new buffers, so θ⁻ never aliases θ.
+ - **The host keeps** the Gymnasium env, the replay buffer and minibatch sampling. Each training step
+   copies one minibatch to the device ($(2d + K + 3) B$ floats) and one scalar $\ell$ back.
++- **Acting is not compiled.** $Q_\theta(s, \cdot)$ for one state is $8 \cdot 64 + 64 \cdot 4 = 768$
++  multiply-adds, about 1 μs as a plain Lux forward pass; as an XLA call it costs 35–70 μs in buffer
++  copies and dispatch, more than the Gymnasium step itself. `action` runs the model on `learner.host`,
++  host arrays refreshed by `copyto!` (~17 μs) the first time it is needed after a training step, so at
++  most once per `train_every` env steps.
++- **Speed on the CPU** (Lunar Lander, `julia -t 1`, per env step, training every 4th): ~1 μs acting
++  plus a ~40 μs refresh every 4 steps, ~55 μs `env.step`, ~51 μs storing and training (a training
++  step at $B = 256$ is ~125–150 μs, the same as Zygote's eager one): **7 800 env steps/s**. The
++  arithmetic per call is a few MFLOP, so every call is overhead, and compiling it buys nothing here;
++  the eager Zygote version of this code runs 9 100 env steps/s.
+ - **Compiled programs are fixed** to their shapes and to the constants traced into them: $B$, $\kappa$,
+   $\eta$, $\tau$. Changing $\tau$ compiles a new Polyak program; changing `batch`, `κ` or `η` on an
+   existing learner does not take effect (build a new one). Editing `DDQNLoss` under Revise likewise
+diff --git a/dm/rl/ddqn/src/ddqn.jl b/dm/rl/ddqn/src/ddqn.jl
+index 5154eb4..e69a6f9 100644
+--- a/dm/rl/ddqn/src/ddqn.jl
++++ b/dm/rl/ddqn/src/ddqn.jl
+@@ -94,6 +94,8 @@ Base.@kwdef mutable struct Learner{M, P<:NamedTuple}
+     steps::Int = 0                # env steps seen so far
+     returns::Vector{Float64} = Float64[]   # every training episode's return G, across train!() calls
+     xla::Dict{Any, Any} = Dict{Any, Any}() # compiled XLA programs, built on first use (`compiled!`)
++    host::Any = nothing           # (θ, st) as plain host arrays for `action`; built on first use
++    host_stale::Bool = true       # θ has changed since `host` was last refreshed
+ end
+ 
+ # Build a Learner around a Lux model. Every keyword except capacity is a field name (defaults
+@@ -130,15 +132,27 @@ online(l::Learner) = l.ts.parameters      # θ, on the XLA device
+ # constants that may change (e.g. τ), so changing one compiles a new program instead of reusing a stale one.
+ compiled!(build, l::Learner, key) = get!(build, l.xla, key)
+ 
+-# ε-greedy on Q_θ(s, ·). Compiled forward pass on a d × 1 batch: nothing here is differentiated.
++# ε-greedy on Q_θ(s, ·): nothing here is differentiated.
++# A plain Lux forward pass on a host copy of θ, not a compiled XLA program. One state is 768
++# multiply-adds, ~1 μs in Julia; an XLA call costs ~35–70 μs in buffer copies and dispatch, which
++# made acting dominate the env step. The copy is refreshed lazily after each training step
++# (`train_batch!` marks it stale), so at most once per `train_every` env steps, by `copyto!` into
++# the same host arrays (~17 μs for the 4 weight arrays, vs ~28 μs allocating new ones).
+ function action(learner::Learner, obs)
+     rand() < learner.ε && return rand(1:spec(learner.envname).actions)     # uniform over K
+-    x = rdev(reshape(obs, :, 1))
+-    q = compiled!(learner, :q) do
+-        @compile learner.model(x, online(learner), learner.ts.states)
++    θ, st = host_params!(learner)
++    Q, _ = learner.model(obs, θ, st)                               # Lux returns (y, st′)
++    return argmax(Q)
++end
++
++function host_params!(learner::Learner)
++    if learner.host === nothing
++        learner.host = (cdev(online(learner)), cdev(learner.ts.states))
++    elseif learner.host_stale
++        foreach(copyto!, Functors.fleaves(learner.host[1]), Functors.fleaves(online(learner)))
+     end
+-    Q, _ = q(x, online(learner), learner.ts.states)                # Lux returns (y, st′)
+-    return argmax(vec(Array(Q)))
++    learner.host_stale = false
++    return learner.host
+ end
+ 
+ # Pop the oldest queued (s₀, a₀) and store it as an m-step transition, m = length(queue):
+@@ -240,6 +254,7 @@ function train_batch!(learner::Learner)
+     onehot[CartesianIndex.(b.a, 1:B)] .= 1
+     data = (rdev((b.s, onehot, b.r, b.g, b.d, b.s′))..., learner.p⁻)
+     _, ℒ, _, learner.ts = Training.single_train_step!(AutoEnzyme(), DDQNLoss(learner.κ), data, learner.ts)
++    learner.host_stale = true                                      # θ changed: `action` re-copies it
+     return Float32(ℒ)
+ end
+ 
